@@ -1,0 +1,375 @@
+name: Compilar navegador Xbox 360
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      DEVKITXENON: /usr/local/xenon
+    steps:
+      - name: Preparar pasta
+        run: |
+          sudo mkdir -p /usr/local/xenon
+          sudo chown -R $USER /usr/local/xenon
+
+      - name: Restaurar toolchain do cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /usr/local/xenon
+          key: xenon-toolchain-v1
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git wget libgmp-dev libmpfr-dev libmpc-dev texinfo flex bison
+
+      - name: Compilar toolchain (demora, so na primeira vez)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/Free60Project/libxenon.git
+          cd libxenon/toolchain
+          ./build-xenon-toolchain toolchain
+          ./build-xenon-toolchain libxenon
+
+      - name: Salvar toolchain no cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /usr/local/xenon
+          key: xenon-toolchain-v1
+
+      - name: Escrever o codigo do navegador
+        run: |
+          cat > main.c <<'EOF'
+          // Navegador de texto simples para Xbox 360 (libxenon). Somente HTTP (sem HTTPS).
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <ctype.h>
+          #include <strings.h>
+          #include <xenos/xe.h>
+          #include <console/console.h>
+          #include <input/input.h>
+          #include <usb/usbmain.h>
+          #include <network/network.h>
+          #include <lwip/sockets.h>
+          #include <lwip/netdb.h>
+          #include <time/time.h>
+          #include <xenon_soc/xenon_power.h>
+
+          #define MAX_PAGE   (512 * 1024)
+          #define COLS       76
+          #define ROWS       24
+          #define MAX_LINKS  128
+
+          static char cur_url[512] = "http://example.com/";
+          static char links[MAX_LINKS][256];
+          static int nlinks = 0;
+          static char *text = NULL;
+          static char **lines = NULL;
+          static int nlines = 0;
+
+          static const char *bookmarks[] = {
+              "http://example.com/",
+              "http://text.npr.org/",
+              "http://lite.cnn.com/",
+              "http://wiki.xxiivv.com/",
+              "http://frogfind.com/",
+          };
+          #define NBOOK (int)(sizeof(bookmarks) / sizeof(bookmarks[0]))
+
+          /* ---------- URL ---------- */
+          static int parse_url(const char *url, char *host, int *port, char *path) {
+              if (strncasecmp(url, "http://", 7) != 0) return 0;
+              const char *p = url + 7;
+              const char *slash = strchr(p, '/');
+              int hl = slash ? (int)(slash - p) : (int)strlen(p);
+              if (hl <= 0 || hl > 127) return 0;
+              char hp[128];
+              memcpy(hp, p, hl); hp[hl] = 0;
+              *port = 80;
+              char *colon = strchr(hp, ':');
+              if (colon) { *colon = 0; *port = atoi(colon + 1); }
+              strcpy(host, hp);
+              strncpy(path, slash ? slash : "/", 383); path[383] = 0;
+              return 1;
+          }
+
+          static void resolve_url(const char *base, const char *href, char *out, size_t n) {
+              if (!strncasecmp(href, "http://", 7)) { snprintf(out, n, "%s", href); return; }
+              if (!strncasecmp(href, "https://", 8)) { snprintf(out, n, "%s", href); return; }
+              char host[128], path[384]; int port;
+              if (!parse_url(base, host, &port, path)) { snprintf(out, n, "%s", href); return; }
+              if (href[0] == '/' && href[1] == '/') { snprintf(out, n, "http:%s", href); return; }
+              if (href[0] == '/') { snprintf(out, n, "http://%s:%d%s", host, port, href); return; }
+              char *q = strchr(path, '?'); if (q) *q = 0;
+              char *ls = strrchr(path, '/'); if (ls) ls[1] = 0;
+              snprintf(out, n, "http://%s:%d%s%s", host, port, path, href);
+          }
+
+          /* ---------- HTTP ---------- */
+          static char *http_get(const char *url, char *location, int *status, char **body_out) {
+              char host[128], path[384]; int port;
+              *status = 0; location[0] = 0;
+              if (!parse_url(url, host, &port, path)) return NULL;
+              struct hostent *he = gethostbyname(host);
+              if (!he) return NULL;
+              int s = socket(AF_INET, SOCK_STREAM, 0);
+              if (s < 0) return NULL;
+              struct sockaddr_in a;
+              memset(&a, 0, sizeof a);
+              a.sin_family = AF_INET;
+              a.sin_port = htons(port);
+              memcpy(&a.sin_addr, he->h_addr_list[0], 4);
+              if (connect(s, (struct sockaddr *)&a, sizeof a) < 0) { lwip_close(s); return NULL; }
+              char req[768];
+              snprintf(req, sizeof req,
+                       "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: X360Browser/1.0\r\n"
+                       "Accept: text/html,text/plain\r\nConnection: close\r\n\r\n", path, host);
+              send(s, req, strlen(req), 0);
+              char *buf = malloc(MAX_PAGE + 1);
+              if (!buf) { lwip_close(s); return NULL; }
+              int n = 0, r;
+              while (n < MAX_PAGE && (r = recv(s, buf + n, MAX_PAGE - n, 0)) > 0) n += r;
+              buf[n] = 0;
+              lwip_close(s);
+              sscanf(buf, "HTTP/%*s %d", status);
+              char *body = strstr(buf, "\r\n\r\n");
+              if (!body) { free(buf); return NULL; }
+              *body = 0; body += 4;
+              for (char *l = strchr(buf, '\n'); l; l = strchr(l + 1, '\n')) {
+                  if (!strncasecmp(l + 1, "Location:", 9)) {
+                      const char *v = l + 10; while (*v == ' ') v++;
+                      int i = 0; while (v[i] && v[i] != '\r' && v[i] != '\n' && i < 510) { location[i] = v[i]; i++; }
+                      location[i] = 0; break;
+                  }
+              }
+              *body_out = body;
+              return buf;
+          }
+
+          /* ---------- HTML -> texto ---------- */
+          static void emit(char *out, int *o, char c) {
+              if (*o >= MAX_PAGE * 2 - 8) return;
+              out[(*o)++] = c;
+          }
+
+          static void html_to_text(const char *h, char *out) {
+              int o = 0, lastspace = 1;
+              int pending_link = -1;
+              nlinks = 0;
+              while (*h) {
+                  if (*h == '<') {
+                      const char *t = h + 1;
+                      int closing = (*t == '/');
+                      if (closing) t++;
+                      char name[16]; int i = 0;
+                      while (isalnum((unsigned char)t[i]) && i < 15) { name[i] = tolower((unsigned char)t[i]); i++; }
+                      name[i] = 0;
+                      const char *end = strchr(h, '>');
+                      if (!end) break;
+                      if (!strncmp(h, "<!--", 4)) { const char *e = strstr(h, "-->"); h = e ? e + 3 : end + 1; continue; }
+                      if (!closing && (!strcmp(name, "script") || !strcmp(name, "style"))) {
+                          const char *p = end + 1;
+                          while (*p && !(p[0] == '<' && p[1] == '/' && !strncasecmp(p + 2, name, strlen(name)))) p++;
+                          const char *e = strchr(p, '>');
+                          h = e ? e + 1 : p; continue;
+                      }
+                      if (!closing && !strcmp(name, "a")) {
+                          const char *hp = t;
+                          while (hp < end && strncasecmp(hp, "href=", 5)) hp++;
+                          if (hp < end && nlinks < MAX_LINKS) {
+                              hp += 5; char q = (*hp == '"' || *hp == '\'') ? *hp++ : 0;
+                              char raw[256]; int k = 0;
+                              while (hp < end + 1 && *hp && k < 255 && ((q && *hp != q) || (!q && *hp != ' ' && *hp != '>'))) raw[k++] = *hp++;
+                              raw[k] = 0;
+                              if (raw[0] && raw[0] != '#' && strncasecmp(raw, "javascript:", 11) && strncasecmp(raw, "mailto:", 7)) {
+                                  resolve_url(cur_url, raw, links[nlinks], 256);
+                                  pending_link = nlinks++;
+                              }
+                          }
+                      }
+                      if (closing && !strcmp(name, "a") && pending_link >= 0) {
+                          char m[16]; snprintf(m, sizeof m, "[%d]", pending_link + 1);
+                          for (char *p = m; *p; p++) emit(out, &o, *p);
+                          pending_link = -1; lastspace = 0;
+                      }
+                      if (!strcmp(name, "br") || !strcmp(name, "p") || !strcmp(name, "div") || !strcmp(name, "li") ||
+                          !strcmp(name, "tr") || !strcmp(name, "h1") || !strcmp(name, "h2") || !strcmp(name, "h3") ||
+                          !strcmp(name, "h4") || !strcmp(name, "ul") || !strcmp(name, "ol") || !strcmp(name, "table")) {
+                          emit(out, &o, '\n');
+                          if (!closing && !strcmp(name, "li")) { emit(out, &o, '*'); emit(out, &o, ' '); }
+                          lastspace = 1;
+                      }
+                      h = end + 1; continue;
+                  }
+                  if (*h == '&') {
+                      static const struct { const char *e; char c; } ent[] = {
+                          {"&amp;", '&'}, {"&lt;", '<'}, {"&gt;", '>'}, {"&quot;", '"'},
+                          {"&nbsp;", ' '}, {"&#39;", '\''}, {"&apos;", '\''} };
+                      int hit = 0;
+                      for (int i = 0; i < 7; i++) {
+                          size_t l = strlen(ent[i].e);
+                          if (!strncmp(h, ent[i].e, l)) { emit(out, &o, ent[i].c); h += l; hit = 1; lastspace = 0; break; }
+                      }
+                      if (hit) continue;
+                  }
+                  unsigned char c = *h++;
+                  if (c == '\r') continue;
+                  if (c == '\n' || c == '\t' || c == ' ') { if (!lastspace) emit(out, &o, ' '); lastspace = 1; }
+                  else { emit(out, &o, c < 128 ? c : '?'); lastspace = 0; }
+              }
+              out[o] = 0;
+          }
+
+          /* ---------- quebra de linhas ---------- */
+          static void wrap_text(void) {
+              free(lines);
+              int cap = 1024; lines = malloc(cap * sizeof(char *)); nlines = 0;
+              char *p = text;
+              while (*p) {
+                  while (*p == ' ') p++;
+                  if (nlines + 2 >= cap) { cap *= 2; lines = realloc(lines, cap * sizeof(char *)); }
+                  char *start = p; int len = 0, lastsp = -1;
+                  while (p[len] && p[len] != '\n' && len < COLS) { if (p[len] == ' ') lastsp = len; len++; }
+                  if (p[len] && p[len] != '\n' && lastsp > 0) len = lastsp;
+                  char save = p[len]; p[len] = 0;
+                  lines[nlines++] = start;
+                  if (save == 0) break;
+                  p += len + 1;
+                  if (save != '\n' && save != ' ') { p--; *p = save; }
+              }
+          }
+
+          /* ---------- carregar página ---------- */
+          static char status_msg[128] = "";
+
+          static int load_page(const char *url) {
+              char target[512]; snprintf(target, sizeof target, "%s", url);
+              for (int hop = 0; hop < 5; hop++) {
+                  console_clrscr();
+                  printf("Carregando %s ...\n", target);
+                  char loc[512]; int st; char *body = NULL;
+                  char *raw = http_get(target, loc, &st, &body);
+                  if (!raw) { snprintf(status_msg, sizeof status_msg, "Erro de conexao (HTTPS nao suportado)"); return 0; }
+                  if ((st == 301 || st == 302 || st == 303 || st == 307 || st == 308) && loc[0]) {
+                      resolve_url(target, loc, target, sizeof target);
+                      free(raw); continue;
+                  }
+                  snprintf(cur_url, sizeof cur_url, "%s", target);
+                  free(text); text = malloc(MAX_PAGE * 2);
+                  if (!text) { free(raw); return 0; }
+                  html_to_text(body, text);
+                  free(raw);
+                  wrap_text();
+                  snprintf(status_msg, sizeof status_msg, "HTTP %d | %d linhas | %d links", st, nlines, nlinks);
+                  return 1;
+              }
+              snprintf(status_msg, sizeof status_msg, "Redirecionamentos demais");
+              return 0;
+          }
+
+          /* ---------- entrada ---------- */
+          static struct controller_data_s pad, prev;
+          static void poll_pad(void) {
+              prev = pad; usb_do_poll(); get_controller_data(&pad, 0);
+          }
+          #define PRESSED(f) (pad.f && !prev.f)
+
+          static void edit_url(void) {
+              static const char cs[] = "abcdefghijklmnopqrstuvwxyz0123456789.:/-_?=&%#~+@";
+              int ci = 0, len = (int)strlen(cur_url);
+              char buf[512]; strcpy(buf, cur_url);
+              int dirty = 1;
+              for (;;) {
+                  if (dirty) {
+                      console_clrscr();
+                      printf("EDITAR URL\nCima/Baixo: letra | A: inserir | B: apagar\nX: 'http://' | Start: ir | Back: cancelar\n\n%s%c\n", buf, cs[ci]);
+                      dirty = 0;
+                  }
+                  poll_pad();
+                  if (PRESSED(up)) { ci = (ci + 1) % (int)(sizeof cs - 1); dirty = 1; }
+                  if (PRESSED(down)) { ci = (ci + (int)sizeof cs - 2) % (int)(sizeof cs - 1); dirty = 1; }
+                  if (PRESSED(a) && len < 500) { buf[len++] = cs[ci]; buf[len] = 0; dirty = 1; }
+                  if (PRESSED(b) && len > 0) { buf[--len] = 0; dirty = 1; }
+                  if (PRESSED(x)) { strcpy(buf, "http://"); len = 7; dirty = 1; }
+                  if (PRESSED(back)) return;
+                  if (PRESSED(start)) { snprintf(cur_url, sizeof cur_url, "%s", buf); load_page(buf); return; }
+                  udelay(16000);
+              }
+          }
+
+          static void bookmark_menu(void) {
+              int sel = 0, dirty = 1;
+              for (;;) {
+                  if (dirty) {
+                      console_clrscr(); printf("FAVORITOS (A abre, B volta)\n\n");
+                      for (int i = 0; i < NBOOK; i++) printf("%s %s\n", i == sel ? ">" : " ", bookmarks[i]);
+                      dirty = 0;
+                  }
+                  poll_pad();
+                  if (PRESSED(up) && sel > 0) { sel--; dirty = 1; }
+                  if (PRESSED(down) && sel < NBOOK - 1) { sel++; dirty = 1; }
+                  if (PRESSED(b)) return;
+                  if (PRESSED(a)) { load_page(bookmarks[sel]); return; }
+                  udelay(16000);
+              }
+          }
+
+          static void draw(int top, int sel_link) {
+              console_clrscr();
+              printf("%.*s\n", COLS, cur_url);
+              for (int i = 0; i < ROWS && top + i < nlines; i++) printf("%s\n", lines[top + i]);
+              printf("\n[%s] Link: %d | A:abrir  Y:URL  X:favoritos  LB/RB:link  B:recarregar", status_msg, sel_link + 1);
+          }
+
+          int main(void) {
+              xenon_make_it_faster(XENON_SPEED_FULL);
+              xenos_init(VIDEO_MODE_AUTO);
+              console_init();
+              usb_init(); usb_do_poll();
+              printf("Iniciando rede...\n");
+              network_init(); network_poll();
+              memset(&pad, 0, sizeof pad); memset(&prev, 0, sizeof prev);
+
+              int top = 0, sel = 0, dirty = 1;
+              load_page(cur_url);
+              for (;;) {
+                  if (dirty) { draw(top, sel); dirty = 0; }
+                  poll_pad();
+                  if (PRESSED(down) || (pad.down && pad.rt)) { if (top + ROWS < nlines) { top += 1; dirty = 1; } }
+                  if (PRESSED(up) || (pad.up && pad.rt)) { if (top > 0) { top -= 1; dirty = 1; } }
+                  if (PRESSED(right)) { top = (top + ROWS < nlines) ? top + ROWS : top; dirty = 1; }
+                  if (PRESSED(left)) { top = (top > ROWS) ? top - ROWS : 0; dirty = 1; }
+                  if (PRESSED(rb) && sel < nlinks - 1) { sel++; dirty = 1; }
+                  if (PRESSED(lb) && sel > 0) { sel--; dirty = 1; }
+                  if (PRESSED(a) && nlinks > 0) { char u[512]; snprintf(u, sizeof u, "%s", links[sel]); load_page(u); top = 0; sel = 0; dirty = 1; }
+                  if (PRESSED(b)) { char u[512]; snprintf(u, sizeof u, "%s", cur_url); load_page(u); top = 0; dirty = 1; }
+                  if (PRESSED(y)) { edit_url(); top = 0; sel = 0; dirty = 1; }
+                  if (PRESSED(x)) { bookmark_menu(); top = 0; sel = 0; dirty = 1; }
+                  network_poll();
+                  udelay(16000);
+              }
+              return 0;
+          }
+          EOF
+
+      - name: Compilar o navegador
+        run: |
+          export PATH=$DEVKITXENON/bin:$PATH
+          xenon-gcc -O2 -Wall -m32 -mcpu=cell -mtune=cell -mno-altivec -mhard-float -fno-pic \
+            -I$DEVKITXENON/usr/include main.c -o browser.elf \
+            -n -T $DEVKITXENON/app.lds -L$DEVKITXENON/xenon/lib/32 -L$DEVKITXENON/usr/lib -lxenon -lm
+          xenon-objcopy -O elf32-powerpc --adjust-vma 0x80000000 browser.elf browser.elf32
+
+      - name: Disponibilizar o arquivo
+        uses: actions/upload-artifact@v4
+        with:
+          name: navegador-xbox360
+          path: browser.elf32
+          
